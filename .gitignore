@@ -221,3 +221,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+#Dataset
+data/
+
+# IDE Config
+.vscode/
+.idea/

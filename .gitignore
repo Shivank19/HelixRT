@@ -229,3 +229,25 @@ data/
 # IDE Config
 .vscode/
 .idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Dataset files
+data/raw/
+data/processed/
+
+# Model checkpoints
+checkpoints/
+*.pt
+*.pth
+
+# Temporary smoke-test results
+results/*_epochs1_history.csv
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env

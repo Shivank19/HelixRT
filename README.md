@@ -8,7 +8,7 @@ HelixRT investigates how a known biological symmetry can be incorporated into a 
 
 The current implementation achieves **0.8144 mean held-out test AUROC** across three training seeds and **zero observed reverse-complement prediction disagreement**. A conventional CNN achieves 0.8065 AUROC and changes its classification for 10.62% of test inputs when their strand representation is reversed.
 
-The deep learning experiments are complete. The symmetry-aware inference engine and its performance benchmarks are the next development milestone.
+The deep learning experiments and inference engine are implemented. In a controlled 12-request demonstration using a trained checkpoint, canonical caching and batch deduplication reduced model sample evaluations from 12 to 2 (83.33%) while preserving predictions within a numerical tolerance of $10^{-6}$. Full CPU and GPU runtime benchmarks are pending.
 
 ## Motivation
 
@@ -110,17 +110,15 @@ All CNNs outperform the GC baseline in AUROC, suggesting that sequence-dependent
 - [Individual test metrics](results/test_metrics.csv)
 - [Aggregated model comparison](results/model_comparison.csv)
 - [Per-sequence test predictions](results/test_predictions.csv)
-- [Model comparison notebook](notebooks/03_model_comparison.ipynb) (once committed)
+- [Model comparison notebook](notebooks/03_model_comparison.ipynb)
 
-<!-- After running notebook 03 and committing the PNG files, uncomment the following figures:
 ![Predictive performance and strand consistency](results/figures/accuracy_consistency_tradeoff.png)
 ![Held-out test ROC curves](results/figures/test_roc_curves.png)
 ![Strand consistency during training](results/figures/rc_consistency_training.png)
--->
 
-## Inference engine (in development)
+## Symmetry-aware inference engine
 
-The next phase will exploit invariance using a canonical sequence key:
+The implemented engine exploits invariance using a canonical sequence key:
 
 $$
 k(x)=\min_{\mathrm{lex}}(x,R(x)).
@@ -140,9 +138,47 @@ flowchart TD
     G --> H[Return predictions]
 ```
 
-Planned comparisons include uncached inference, exact-sequence caching, canonical caching, and canonical caching with within-batch deduplication. Benchmarks will vary redundancy, batch size and cache capacity on CPU and GPU, recording throughput, batch latency percentiles, cache hits and encoder sample evaluations.
+### Execution modes
 
-The engine will scope cached predictions to a fixed model instance. The invariant CNN requires two encoder evaluations per uncached unique sequence; whether canonicalization offsets that cost depends on the workload and hardware. TTA also supports canonical caching and is a relevant alternative. No measured inference speedup is claimed yet.
+| Mode              | Persistent cache | Canonical keys | Within-batch deduplication |
+| ----------------- | ---------------- | -------------- | -------------------------- |
+| `none`            | No               | No             | No                         |
+| `exact`           | Yes              | No             | No                         |
+| `canonical`       | Yes              | Yes            | No                         |
+| `canonical_dedup` | Yes              | Yes            | Yes                        |
+| `dedup_only`      | No               | Yes            | Yes                        |
+
+The engine supports ordinary CNN inference, test-time reverse-complement averaging (TTA), and the invariant CNN. Canonical modes reject ordinary non-invariant CNN inference because sharing predictions between strands would otherwise alter model behavior.
+
+Each engine owns a bounded LRU cache scoped to a fixed model instance. A dictionary groups equivalent pending requests, and their original indices are retained to restore output order after batched inference. Cache hits and within-batch duplicates are counted separately. All inputs are validated before cache lookup, and the model runs in evaluation and inference mode.
+
+### Algorithmic complexity
+
+For $N$ incoming sequences of length $L$, $U$ unique uncached canonical keys, cache capacity $C$, and model sample evaluation cost $F(L)$, the optimized engine requires approximately $O(NL + UF(L))$ computational work, compared with $O(NL + NF(L))$ for unoptimized end-to-end inference. Canonicalization and hashing require linear work in sequence length; LRU operations and dictionary lookups have expected constant-time cost after key hashing. Cache storage is $O(CL)$, excluding model weights and temporary inference tensors. This analysis describes computational work, not wall-clock execution time on parallel hardware.
+
+### Trained-model inference demonstration
+
+A workload of six requests containing two distinct underlying DNA segments was submitted twice to each engine mode, starting with an empty cache of capacity 128. The demonstration used the trained invariant CNN (seed 42, checkpoint selected by validation AUROC) on CPU. All modes returned numerically equivalent predictions within an absolute tolerance of $10^{-6}$.
+
+| Mode                      | Requests | Cache hits | Batch duplicates eliminated | Model sample evaluations | Encoder sample evaluations | Final cache entries |
+| ------------------------- | -------: | ---------: | --------------------------: | -----------------------: | -------------------------: | ------------------: |
+| Uncached                  |       12 |          0 |                           0 |                       12 |                         24 |                 N/A |
+| Exact cache               |       12 |          6 |                           0 |                        6 |                         12 |                   4 |
+| Canonical cache           |       12 |          6 |                           0 |                        6 |                         12 |                   2 |
+| Canonical + deduplication |       12 |          6 |                           4 |                    **2** |                      **4** |               **2** |
+| Deduplication only        |       12 |          0 |                           8 |                        4 |                          8 |                 N/A |
+
+The fully optimized engine avoided 10 of 12 model sample evaluations (83.33%), or 20 of 24 encoder sample evaluations. Canonical caching also occupied half as many cache entries as exact caching. These results describe a deliberately redundant demonstration, not a representative production workload, measured memory savings in bytes, or a runtime speedup.
+
+The invariant CNN processes two strand representations per logical model sample. A standard CNN processes one. TTA also provides a valid basis for canonical caching and is a competitive alternative. Runtime measurements are needed to determine whether the reduction in neural computation offsets preprocessing and cache overhead.
+
+### Performance benchmarking (pending)
+
+The planned benchmark suite will compare the five engine modes using the same frozen invariant checkpoint, alongside conventional CNN and augmented TTA baselines (including optimized TTA). An exact-key deduplication control is desirable to separate the benefits of generic duplicate detection from biological symmetry.
+
+Experiments will vary request redundancy, duplicate type, request batch size, cache capacity and initial cache state. CPU and GPU measurements will report sequences per second, p50 and p95 batch completion latency, cache hits and evictions, and model and encoder sample evaluations. Workloads will use reproducibly generated request streams from real genomic sequences; GPU timing will include synchronization and model warm-up outside measured runs.
+
+No wall-clock performance improvements or empirical break-even points are claimed yet.
 
 ## Reproducing the experiments
 
@@ -210,7 +246,41 @@ Expected outputs:
 | `results/model_comparison.csv` |       6 |
 | `results/test_predictions.csv` | 111,168 |
 
-The GC baseline has undefined sample standard deviation because it has one run. This is expected. Run `notebooks/03_model_comparison.ipynb` after adding it to the repository to regenerate figures from the saved predictions and histories.
+The GC baseline has undefined sample standard deviation because it has one run. This is expected. Run `notebooks/03_model_comparison.ipynb` to regenerate figures from the saved predictions and histories.
+
+### 5. Verify and use the inference engine
+
+```bash
+python -m pytest tests/ -v
+python -m scripts.demo_inference
+```
+
+The demonstration requires the processed test CSV and `checkpoints/invariant_seed42_epochs100.pt`.
+
+To use the engine programmatically from the repository root:
+
+```python
+from src.inference import InferenceEngine
+from src.sequence import reverse_complement
+
+engine = InferenceEngine.from_checkpoint(
+    model_name="invariant",
+    seed=42,
+    epochs=100,
+    device="cpu",
+    mode="canonical_dedup",
+    cache_capacity=1024,
+    batch_size=128,
+)
+
+# Synthetic diagnostic input (not a biological prediction example).
+sequence = "ATGCCA" * 83 + "AT"
+predictions = engine.predict([sequence, reverse_complement(sequence)])
+print(predictions)
+print(engine.stats())
+```
+
+The two equivalent requests should return the same probability while requiring one logical model sample evaluation. Subsequent requests can reuse the cached result.
 
 ## Repository layout
 
@@ -226,20 +296,28 @@ HelixRT/
 │   ├── dataset.py
 │   ├── models.py
 │   ├── train.py
-│   └── evaluate.py
-├── scripts/train_all.bat
+│   ├── evaluate.py
+│   ├── cache.py
+│   └── inference.py
+├── scripts/
+│   ├── train_all.bat
+│   └── demo_inference.py
 ├── tests/
+│   ├── test_sequence.py
+│   ├── test_models.py
+│   ├── test_cache.py
+│   └── test_inference.py
 ├── checkpoints/             # Generated locally
 ├── results/
 ├── requirements.txt
 └── README.md
 ```
 
-Upcoming modules: `src/cache.py`, `src/inference.py`, `tests/test_cache.py`, `tests/test_inference.py`, and `benchmarks/benchmark_inference.py`.
+Upcoming benchmark artifacts: `benchmarks/workload.py`, `benchmarks/benchmark_inference.py`, `tests/test_benchmark.py`, and `notebooks/04_inference_benchmarks.ipynb`.
 
 ## Limitations
 
-The current study uses one human enhancer benchmark and three training seeds. It does not establish generalization to other organisms or experimental conditions, statistical significance of small AUROC differences, or biological causality of learned features. Equal parameter counts do not imply equal training or inference compute. TTA's recorded RC consistency is calculated by averaging the same independently generated predictions in both orders; standalone TTA runtime verification remains future work. Exact reproducibility across hardware is not guaranteed.
+The current study uses one human enhancer benchmark and three training seeds. It does not establish generalization to other organisms or experimental conditions, statistical significance of small AUROC differences, or biological causality of learned features. Equal parameter counts do not imply equal training or inference compute. TTA's recorded RC consistency is calculated by averaging the same independently generated predictions in both orders; the inference engine includes a standalone TTA consistency test, while trained-checkpoint performance benchmarking remains pending. Exact reproducibility across hardware is not guaranteed. The engine is synchronous and single-threaded at the request level, uses full sequence strings as keys, and bounds cache entries rather than memory bytes. Cache insertions for misses occur after batch execution, so recency semantics differ from strictly sequential LRU. Cached values assume fixed model weights and configuration. The demonstration verifies a small redundant workload; it does not establish runtime benefits or production readiness.
 
 ## Research foundations
 
